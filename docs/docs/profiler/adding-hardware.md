@@ -154,6 +154,12 @@ so use cautiously. The other two paths are strongly preferred.
 
 ### What to put in `meta.yaml`
 
+Synthetic bundles can set `require_full_layer_coverage: true` in `meta.yaml`.
+The simulator then rejects missing layers and non-finite or nonpositive CSV
+prices before generating a trace. LLMCompass exports enable this check. It
+checks the active dense or MoE sequence, including TP-stable lookups; it does
+not validate the hardware model or the accuracy of interpolation.
+
 Even when synthesizing, write a `meta.yaml` so the simulator's
 runtime warnings work properly:
 

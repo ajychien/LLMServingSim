@@ -11,6 +11,7 @@ from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
 import bisect
+from math import isfinite
 from dataclasses import dataclass, field
 
 # ----------------------------------------------------------------------
@@ -252,7 +253,7 @@ def _read_skew_fit_csv(path):
     return alphas, counts
 
 
-def _read_category_csv(path, key_cols):
+def _read_category_csv(path, key_cols, require_positive=False):
     """Read a category CSV and return a dict per layer (for dense/per_sequence)
     or a list of rows (for attention/moe).
 
@@ -262,8 +263,11 @@ def _read_category_csv(path, key_cols):
     if not os.path.isfile(path):
         return None
     df = pd.read_csv(path, sep=",")
+    times = df["time_us"].astype(float)
+    if require_positive and any(not isfinite(value) or value <= 0 for value in times):
+        raise ValueError(f"Non-finite or nonpositive time_us in {path}")
     # time_us -> latency_ns (int, min 1)
-    df["latency_ns"] = (df["time_us"].astype(float) * 1_000.0).round().astype(int).clip(lower=1)
+    df["latency_ns"] = (times * 1_000.0).round().astype(int).clip(lower=1)
     return df
 
 
@@ -475,22 +479,22 @@ def _lookup_1d(keys, values, query):
     return _linear_interpolate(keys[lo], values[lo], keys[hi], values[hi], query)
 
 
-def _build_tp_tables(tp_dir):
+def _build_tp_tables(tp_dir, require_positive=False):
     """Build every category table present in one ``tp<N>/`` folder."""
     tables = {}
-    dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
+    dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None, require_positive)
     if dense_df is not None:
         tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
 
-    per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
+    per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None, require_positive)
     if per_seq_df is not None:
         tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
 
-    attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
+    attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None, require_positive)
     if attn_df is not None:
         tables["attention"] = _build_attention_table(attn_df)
 
-    moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
+    moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None, require_positive)
     if moe_df is not None:
         tables["moe"] = _build_moe_table(moe_df)
     return tables
@@ -521,7 +525,9 @@ def _tp_tables(perf_db, tp):
             f"{perf_db['model']}/{perf_db['variant']}; available: "
             f"{perf_db['available_tps']}"
         )
-    tables = _build_tp_tables(os.path.join(perf_db["root"], f"tp{tp}"))
+    tables = _build_tp_tables(
+        os.path.join(perf_db["root"], f"tp{tp}"),
+        require_positive=(perf_db.get("meta") or {}).get("require_full_layer_coverage", False))
     perf_db["tables"][tp] = tables
     return tables
 
@@ -916,6 +922,13 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     head_dim = config.get('head_dim', n_embd // n_head)
     is_moe = gate is not None
 
+    if (perf_db.get("meta") or {}).get("require_full_layer_coverage", False):
+        coverage_key = (tp_size, hardware, is_moe)
+        checked = perf_db.setdefault("layer_coverage_checked", set())
+        if coverage_key not in checked:
+            preflight_layer_coverage(perf_db, tp_size, hardware, is_moe=is_moe)
+            checked.add(coverage_key)
+
     pim_channels = 0
     if enable_attn_offloading and pim_model is not None:
         pim_config = pim_model.get_config()
@@ -1208,6 +1221,53 @@ def _sequence(perf_db, section):
 
 
 _skipped_layer_warned = set()
+
+
+def preflight_layer_coverage(perf_db, tp, hardware, is_moe=False):
+    """Reject incomplete or nonpositive prices for the active model sequence.
+
+    Exported simulator bundles opt into this check with
+    ``meta.yaml::require_full_layer_coverage``. Validate the actual lookup
+    tables, including TP-stable layers at tp1 and the tp1 MoE expert table,
+    before emitting any trace rows. This checks sampled prices, not the
+    fidelity or calibration range of their interpolation.
+    """
+    sections = ("prologue", "pre_attn", "post_attn",
+                "mlp_moe" if is_moe else "mlp_dense", "head")
+    layers = dict.fromkeys(
+        name for section in sections for name in _sequence(perf_db, section))
+    problems = []
+    if not layers:
+        problems.append("empty architecture sequence")
+    for name in layers:
+        if name == "rotary_emb" and "TPU" in hardware:
+            continue
+        category = _layer_category(perf_db, name)
+        if category is None:
+            problems.append(f"{name}: missing architecture catalog entry")
+            continue
+        tp_eff = 1 if category == "moe" else _effective_tp(perf_db, category, name, tp)
+        tables = _tp_tables(perf_db, tp_eff)
+        table = tables.get(category) or {}
+        rows = []
+        if category in ("dense", "per_sequence"):
+            rows = [table[name]] if name in table else []
+        elif category == "attention":
+            rows = [row for entry in table.get("slices", {}).values()
+                    for row in entry["rows"]]
+        elif category == "moe":
+            rows = table.get("rows", [])
+        if not rows:
+            problems.append(f"{name}: missing {category} profile at tp={tp_eff}")
+            continue
+        if any(not row["keys"] or len(row["keys"]) != len(row["values"])
+               or any(not isfinite(value) or value <= 0 for value in row["values"])
+               for row in rows):
+            problems.append(f"{name}: empty, non-finite or nonpositive prices at tp={tp_eff}")
+    if problems:
+        raise ValueError(
+            f"Incomplete layer coverage for {hardware}/{perf_db['model']}/"
+            f"{perf_db['variant']}:\n  - " + "\n  - ".join(problems))
 
 
 def _layer_available(perf_db, tp, layer_name):
