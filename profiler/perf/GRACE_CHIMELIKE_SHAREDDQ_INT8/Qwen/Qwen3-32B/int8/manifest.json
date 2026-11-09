@@ -1,0 +1,56 @@
+{
+  "knobs": {
+    "d_model": 5120,
+    "decode_attention": {
+      "model": "chime_like",
+      "paged": {
+        "page_tokens": 256,
+        "page_ns": 20800.0,
+        "page_parts_ns": {
+          "q_load": 320.0,
+          "qk": 10240.0,
+          "sv": 10240.0,
+          "softmax": 0.0,
+          "score_flush": 0.0,
+          "readout": 0.0
+        },
+        "partial_bytes": 2120.0,
+        "q_bytes": 1024,
+        "kv_bytes_per_token_head": 256,
+        "slots": 2048,
+        "banks_per_device": 16,
+        "n_kv_heads": 8,
+        "pin_bandwidth_Bps": 409600000000.0,
+        "host_Bps": 3352000000000.0,
+        "open_page_on_host": true,
+        "same_device": true,
+        "execution": "lockstep per device",
+        "sv_mapping": "RMNCK",
+        "arrays_per_bank": 4,
+        "rowblock_ns": 0.0,
+        "pages_per_rowblock": 0,
+        "schedule": "chime_like",
+        "score_roundtrip_bytes": 8192,
+        "score_bytes": 2,
+        "prob_bytes": 2
+      },
+      "pin_bandwidth_Bps": 409600000000.0,
+      "slots": 2048,
+      "note": "CHIME-like (ISCA'26 CHIME-PIM): INT8 bank MACs at the column rate, softmax / merge / re-layout on an off-die rank PU"
+    },
+    "dtype": "int8",
+    "ffn_dim": 25600,
+    "model": "Qwen/Qwen3-32B",
+    "n_heads": 64,
+    "n_kv_heads": 8,
+    "pim_compile_mode": "exhaustive",
+    "profile_id": "a100-ae-v1",
+    "tp_degrees": [
+      1
+    ],
+    "vocab_size": 151936,
+    "derived_from": "GRACE_PIM_LA4_TCCDL_CLK400_LBREUSE_TOKENPACKED_RMNCK_PAGED_P8_INT8",
+    "derived_note": "paged record replaced by MultiPIMSim experiments/chime-like-baseline/make_bundle.py; other tables copied from the source bundle"
+  },
+  "source_paths": []
+}

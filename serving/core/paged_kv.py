@@ -62,6 +62,13 @@ Opt-in what-ifs (decode_attention_offload keys, all off by default; MultiPIMSim 
   own pass is about its share of the two together (the trace generator also floors each sub-batch's charge at its own
   pass, ``cost_ns`` of its requests).
 
+Off-die softmax (manifest ``score_roundtrip_bytes``, default 0; MultiPIMSim experiments/chime-like-baseline): a device
+whose banks compute the products but whose softmax runs outside the die (CHIME's buffer-chip rank PU) moves each attended
+page's scores out and its probabilities back over the dies' DQ. Those bytes join the pins term, and with ``pin_overlap``
+the last lockstep round's round trip joins the tail (it has no compute to hide behind). With ``offdie_bandwidth_Bps``
+set (a buffer chip with its own link to every die), the die-side traffic (everything that crosses the pins, plus the
+round trips) runs at that bandwidth and the host side (Q, partials, new K/V) at the pins'; the device pays the slower.
+
 HBM write-through page cache (``gpu_resident_cache`` "nofetch" / "fetch" with ``gpu_resident_mode`` "balanced",
 ``set_hbm_cache``): every full page lives on the device, as without it, and the instance's memory caches the most
 recently filled pages. A page that fills was the open page (or, at the handoff, prefilled KV), so it enters the cache at
@@ -100,6 +107,8 @@ class PagedKVAllocator:
         self.kv_bytes_token_head = float(rec["kv_bytes_per_token_head"])
         self.pin_Bpns = float(rec["pin_bandwidth_Bps"]) / 1e9
         self.host_Bpns = float(rec["host_Bps"]) / 1e9
+        self.roundtrip_bytes = float(rec.get("score_roundtrip_bytes") or 0.0)   # off-die softmax: S out + P in per page
+        self.die_Bpns = float(rec.get("offdie_bandwidth_Bps") or 0.0) / 1e9     # 0: the die side is the pins
         self.slots = int(rec["slots"])
         self.banks = int(rec["banks_per_device"])
         self.devices = self.slots // self.banks
@@ -478,6 +487,9 @@ class PagedKVAllocator:
                         partials += len(m[0]) if self.merge else len(ent[1])
                         qcopies += len(m[1]) if self.spread == "global" else 1
         pins = (partials * self.partial_bytes + qcopies * self.q_bytes + new_kv) / self.pin_Bpns
+        if self.roundtrip_bytes:               # off-die softmax: the attended pages' S and P cross the dies' DQ too
+            die_Bpns = self.die_Bpns or self.pin_Bpns
+            pins = max(pins, (pins * self.pin_Bpns + pages * self.roundtrip_bytes) / die_Bpns)
         host = partials * self.partial_bytes / self.host_Bpns
         if self.ppb:
             compute = self._rowblock_compute_ns(ids, pages == self.pages)
@@ -498,6 +510,8 @@ class PagedKVAllocator:
             return compute + pins + host
         head = min(qcopies, pages, self.slots) * self.q_bytes / self.pin_Bpns
         tail = min(partials, self.slots) * self.partial_bytes / self.pin_Bpns
+        if self.roundtrip_bytes:
+            tail += min(pages, self.slots) * self.roundtrip_bytes / (self.die_Bpns or self.pin_Bpns)
         self.last_cost.update(head=head, tail=tail)
         return max(head + compute * self.overlap_factor + tail, pins) + host
 
