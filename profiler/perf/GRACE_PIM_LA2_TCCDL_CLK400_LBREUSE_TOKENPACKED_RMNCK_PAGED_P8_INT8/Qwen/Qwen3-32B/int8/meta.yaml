@@ -1,0 +1,6 @@
+hardware: a100-ae-v1
+source: A100_real_hardware
+pim_compile_mode: exhaustive
+profiled_at: '2026-11-11T15:46:37.927540'
+skew_fit:
+  enabled: false
