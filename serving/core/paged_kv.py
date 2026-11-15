@@ -62,6 +62,13 @@ Opt-in what-ifs (decode_attention_offload keys, all off by default; MultiPIMSim 
   own pass is about its share of the two together (the trace generator also floors each sub-batch's charge at its own
   pass, ``cost_ns`` of its requests).
 
+- ``pim_power_cap_w_per_die`` (MultiPIMSim experiments/pim-duet-power-cap; bundles without V row blocks only): a
+  per-die power cap. A die's sequencer waits between page steps so that its average power over the layer stays within
+  the cap. A die then takes max(its busiest bank's pages x page step, its attended pages x ``pim_page_energy_j`` /
+  (cap - ``pim_static_w_per_die``)), and the slowest die sets the layer. The page energy is the dynamic energy of one
+  page step on one bank (every event: activations, columns, trees, PE, LB, pins); the static power is the die's
+  background, refresh and logic leakage. The dies and the page step are unchanged; only the waits are added.
+
 Off-die softmax (manifest ``score_roundtrip_bytes``, default 0; MultiPIMSim experiments/chime-like-baseline): a device
 whose banks compute the products but whose softmax runs outside the die (CHIME's buffer-chip rank PU) moves each attended
 page's scores out and its probabilities back over the dies' DQ. Those bytes join the pins term, and with ``pin_overlap``
@@ -145,6 +152,15 @@ class PagedKVAllocator:
         if self.pin_overlap and self.ppb:
             raise ValueError("pin_overlap needs a bundle without V row blocks (pages_per_rowblock 0)")
         self.last_cost = {}                    # the last cost_ns call's terms (ns), for observers
+        self.cap_w = float(opts.get("pim_power_cap_w_per_die") or 0.0)      # 0: no power cap
+        if self.cap_w:
+            if self.ppb:
+                raise ValueError("pim_power_cap_w_per_die needs a bundle without V row blocks (pages_per_rowblock 0)")
+            self.page_j = float(opts["pim_page_energy_j"])
+            budget = self.cap_w - float(opts["pim_static_w_per_die"])
+            if budget <= 0:
+                raise ValueError("pim_power_cap_w_per_die must exceed pim_static_w_per_die")
+            self.cap_page_ns = self.page_j / budget * 1e9              # one page's energy at the dynamic budget (ns)
         self.sub_aware = bool(opts.get("sub_batch_placement", False))
         if self.sub_aware and self.ppb:
             raise ValueError("sub_batch_placement needs a bundle without V row blocks (pages_per_rowblock 0)")
@@ -495,7 +511,8 @@ class PagedKVAllocator:
             compute = self._rowblock_compute_ns(ids, pages == self.pages)
         else:
             if pages == self.pages:            # every resident page is attended: the bank counts are the running ones
-                busiest = max(self.load) if self.pages else 0
+                load = self.load
+                busiest = max(load) if self.pages else 0
             else:
                 count = {}
                 for rid in ids:
@@ -504,8 +521,20 @@ class PagedKVAllocator:
                         for s, _ in (ent[1] if ent else ()):
                             count[s] = count.get(s, 0) + 1
                 busiest = max(count.values(), default=0)
+                load = None
             compute = busiest * self.page_ns
+            uncapped = compute
+            if self.cap_w and pages:           # per-die power cap: each die's energy at its dynamic budget
+                if load is None:
+                    load = [0] * self.slots
+                    for s, n in count.items():
+                        load[s] = n
+                for d in range(self.devices):
+                    r = load[d * self.banks:(d + 1) * self.banks]
+                    compute = max(compute, max(r) * self.page_ns, sum(r) * self.cap_page_ns)
         self.last_cost = dict(compute=compute, pins=pins, host=host, head=0.0, tail=0.0)
+        if self.cap_w and not self.ppb:
+            self.last_cost["compute_uncapped"] = uncapped
         if not self.pin_overlap:
             return compute + pins + host
         head = min(qcopies, pages, self.slots) * self.q_bytes / self.pin_Bpns

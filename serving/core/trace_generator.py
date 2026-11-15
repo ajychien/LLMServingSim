@@ -2054,7 +2054,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                                 {k: attn_offload[k] for k in ("rowblock_merge", "rowblock_affinity", "page_spread",
                                                               "rowblock_affinity_slack_pages", "rowblock_merge_min_pages",
                                                               "pin_overlap", "pin_overlap_compute_factor",
-                                                              "sub_batch_placement")
+                                                              "sub_batch_placement", "pim_power_cap_w_per_die",
+                                                              "pim_page_energy_j", "pim_static_w_per_die")
                                  if k in attn_offload})
         if int(attn_offload.get("gpu_open_page_tokens", 0)) != alloc.P:
             raise ValueError(f"kv_allocator 'paged' keeps each request's open page on the instance: set "
